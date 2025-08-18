@@ -1,36 +1,34 @@
-// packages/@schmooky/pixi-rive/src/index.ts
 import {
   Sprite,
   Texture,
-  TextureSource,
+  CanvasSource,
   Ticker,
-  Container, // exported for convenience (see note below)
-  Graphics,  // exported for convenience (see note below)
 } from 'pixi.js';
-
 import { Rive, RuntimeLoader } from '@rive-app/canvas';
 
 RuntimeLoader.setWasmUrl('/rive.wasm');
 
 export type RiveSpriteOptions = {
-  /** URL to a .riv file (e.g. '/vehicles.riv' under your app's public folder) */
-  src: string;
-  /** Autoplay the default animation (if present). Default: true */
-  autoplay?: boolean;
-  /** Logical display size (width == height). Default: 512 */
-  size?: number;
-  /** Enable pointer events; you can listen via .on('pointerdown', ...) */
+  src: string;        // .riv URL
+  autoplay?: boolean; // default true
+  size?: number;      // logical size; backing store uses DPR
   interactive?: boolean;
-  /** Enable verbose console logs. Default: true */
-  debug?: boolean;
+  debug?: boolean;    // default true
 };
 
 export class RiveSprite extends Sprite {
   private _rive?: Rive;
-  private _canvas!: HTMLCanvasElement;
+
+  // Rive draws into this (no DOM sizing)
+  private _off!: OffscreenCanvas;
+
+  // Pixi uploads from this (stays constant → no source swapping)
+  private _disp!: HTMLCanvasElement;
+  private _dispCtx!: CanvasRenderingContext2D;
+  private _dispSrc!: CanvasSource; // Pixi v8 CanvasSource wrapping _disp
 
   private _ticker?: Ticker;
-  private _tick = (t: Ticker) => this.update(t.elapsedMS);
+  private _tick = (ticker: Ticker) => this.update(ticker.elapsedMS);
 
   private _src: string;
   private _autoplay: boolean;
@@ -38,23 +36,31 @@ export class RiveSprite extends Sprite {
   private _dpr: number;
   private _ready = false;
   private _destroyed = false;
-  private _didFirstUpload = false;
   private _debug = true;
 
   private TAG = '[RiveSprite]';
 
   constructor(opts: RiveSpriteOptions) {
-    // config
     const size = opts.size ?? 512;
     const dpr = Math.max(1, window.devicePixelRatio || 1);
 
-    // backing canvas (DPR-aware)
-    const canvas = document.createElement('canvas');
-    canvas.width = Math.max(2, Math.floor(size * dpr));
-    canvas.height = Math.max(2, Math.floor(size * dpr));
+    const W = Math.max(2, Math.floor(size * dpr));
+    const H = Math.max(2, Math.floor(size * dpr));
 
-    // wrap canvas as Pixi texture
-    const texture = Texture.from(canvas);
+    // 1) OffscreenCanvas for Rive
+    const off = new OffscreenCanvas(W, H);
+
+    // 2) HTMLCanvas for Pixi's texture source (never swapped)
+    const disp = document.createElement('canvas');
+    disp.width = W;
+    disp.height = H;
+    const dispCtx = disp.getContext('2d', { alpha: true });
+    if (!dispCtx) throw new Error('2D context not available for display canvas');
+
+    // 3) Pixi v8: build a CanvasSource around the display canvas, then a Texture
+    const dispSrc = new CanvasSource({ resource: disp });
+    const texture = new Texture({ source: dispSrc });
+
     super({ texture });
 
     this._src = opts.src;
@@ -62,67 +68,50 @@ export class RiveSprite extends Sprite {
     this._size = size;
     this._dpr = dpr;
     this._debug = opts.debug ?? true;
-    this._canvas = canvas;
 
-    // keep logical display size equal to `size`
-    this.scale.set(1 / dpr);
+    this._off = off;
+    this._disp = disp;
+    this._dispCtx = dispCtx;
+    this._dispSrc = dispSrc;
 
-    // optional pointer events
-    if (opts.interactive) {
-      this.eventMode = 'static';
-      this.cursor = 'pointer';
-    }
+    this.log('ctor', { size, dpr, W, H, src: this._src, autoplay: this._autoplay });
 
-    this.log('ctor', {
-      size: this._size,
-      dpr: this._dpr,
-      canvas: { w: canvas.width, h: canvas.height },
-      autoplay: this._autoplay,
-      src: this._src,
-    });
+    // Seed: define GPU level 0 once from the empty display canvas
+    this._dispSrc.update();
 
     // async init
     this.init().catch((err) => this.error('init() failed', err));
   }
 
-  /** True after the file is loaded and first frame uploaded. */
-  get isReady() {
-    return this._ready;
-  }
+  get isReady() { return this._ready; }
 
-  /** Change the .riv source at runtime. */
   async setSource(src: string) {
     this.log('setSource', { from: this._src, to: src });
     this._src = src;
     await this.initRive();
   }
 
-  /** Pause playback (keeps last frame). */
   pause() {
     this.log('pause');
     this._autoplay = false;
-    if (this._rive) (this._rive as any).pause?.();
+    try { (this._rive as any)?.pause?.(); } catch {}
   }
 
-  /** Resume playback. */
   play() {
     this.log('play');
     this._autoplay = true;
-    if (this._rive) (this._rive as any).play?.();
+    try { (this._rive as any)?.play?.(); } catch {}
   }
 
-  /** Start ticker-driven updates (auto-called after init). */
   enable() {
     this.log('enable');
     if (!this._ticker) {
-      // Use system ticker so it stays in lockstep with Application
       this._ticker = Ticker.system;
       this._ticker.add(this._tick);
       this.log('enable.ticker.added', { systemTicker: true });
     }
   }
 
-  /** Stop updates (keeps last uploaded frame). */
   disable() {
     this.log('disable');
     if (this._ticker) {
@@ -132,23 +121,14 @@ export class RiveSprite extends Sprite {
     }
   }
 
-  /** Pixi lifecycle: clean up runtime and ticker. */
   destroy(options?: boolean) {
     this.log('destroy.begin', { options });
-    if (this._destroyed) {
-      this.warn('destroy.called_twice');
-      return;
-    }
+    if (this._destroyed) { this.warn('destroy.called_twice'); return; }
     this._destroyed = true;
 
     this.disable();
-
-    try {
-      this._rive?.cleanup();
-      this.log('destroy.rive.cleanup_ok');
-    } catch (e) {
-      this.warn('destroy.rive.cleanup_error', e);
-    }
+    try { this._rive?.cleanup(); this.log('destroy.rive.cleanup_ok'); }
+    catch (e) { this.warn('destroy.rive.cleanup_error', e); }
 
     super.destroy(options);
     this.log('destroy.end');
@@ -163,14 +143,32 @@ export class RiveSprite extends Sprite {
     this.log('init.end', { ready: this._ready });
   }
 
+  /** Keep both canvases sized to size×dpr. */
+  private resizeCanvases(size: number, dpr: number) {
+    const W = Math.max(2, Math.floor(size * dpr));
+    const H = Math.max(2, Math.floor(size * dpr));
+
+    if (this._off.width !== W || this._off.height !== H) {
+      this._off.width = W;
+      this._off.height = H;
+      this.log('offscreen.resize', { W, H });
+    }
+
+    if (this._disp.width !== W || this._disp.height !== H) {
+      this._disp.width = W;
+      this._disp.height = H;
+      this._dispSrc.update(); // inform Pixi that the HTMLCanvas dimensions changed
+      this.log('display.resize', { W, H });
+    }
+  }
+
   private async initRive() {
     this._ready = false;
-    this._didFirstUpload = false;
 
     const src = this._src;
     this.log('initRive.start', { src });
 
-    // Fetch the .riv bytes
+    // Fetch .riv
     let bytes: ArrayBuffer;
     try {
       const resp = await fetch(src);
@@ -193,90 +191,60 @@ export class RiveSprite extends Sprite {
       this.warn('initRive.old.cleanup_error', e);
     }
 
-    // Create the runtime bound to our canvas
+    // Ensure canvases match current DPR/size before creating Rive
+    this.resizeCanvases(this._size, this._dpr);
+
+    // Create Rive bound to our OffscreenCanvas
     try {
       this._rive = new Rive({
         buffer: bytes,
-        canvas: this._canvas,
+        canvas: this._off as any,   // OffscreenCanvas
         autoplay: this._autoplay,
       });
+      (this._rive as any).resizeDrawingSurfaceToCanvas?.(); // once
       this.log('initRive.rive.created', { autoplay: this._autoplay });
     } catch (e) {
       this.error('initRive.rive.create_failed', e);
       throw e;
     }
 
-    // Force-first upload so something is visible immediately
-    try {
-      const ts = this.texture?.source as TextureSource | any;
-      if (ts && typeof ts.update === 'function') {
-        ts.update();
-        this._didFirstUpload = true;
-        this.log('initRive.texture.first_upload_ok');
-      } else {
-        this.warn('initRive.texture.no_update_method');
-      }
-    } catch (e) {
-      this.warn('initRive.texture.first_upload_error', e);
-    }
+    // Do one blit from offscreen → display, then upload so the first frame is visible
+    this.blitAndUpload('initRive.first_blit');
 
     this._ready = true;
     this.log('initRive.end', { ready: this._ready });
   }
 
-  /** Called every frame by Pixi’s ticker. */
-  private update(deltaMS: number) {
-    if (!this._rive) {
-      this.debug('update.skip.no_rive');
-      return;
-    }
-    if (!this._ticker) {
-      this.debug('update.skip.no_ticker');
-      return;
-    }
-
-    // Rive (canvas runtime) draws into our canvas; we just need to mark the Pixi
-    // CanvasSource as dirty so it uploads fresh pixels to the GPU.
+  /** Copy OffscreenCanvas → HTMLCanvas and upload to GPU. */
+  private blitAndUpload(where: string) {
     try {
-      const ts = this.texture?.source as TextureSource | any;
-      if (ts && typeof ts.update === 'function') {
-        ts.update();
-        if (!this._didFirstUpload) {
-          this._didFirstUpload = true;
-          this.log('update.first_upload_seen');
-        }
-      } else {
-        this.warn('update.texture.no_update_method');
+      const w = this._off.width, h = this._off.height;
+      if (w === 0 || h === 0) {
+        this.warn(`${where}.skip_zero_size`, { w, h });
+        return;
       }
+      // Draw offscreen onto the display canvas (same dimensions)
+      this._dispCtx.drawImage(this._off as any, 0, 0);
+      // Tell Pixi the CanvasSource changed
+      this._dispSrc.update();
+      this.debug(`${where}.ok`);
     } catch (e) {
-      this.warn('update.texture.upload_error', e);
+      this.warn('blit.upload_error', e);
     }
+  }
+
+  /** Called every frame by Pixi’s ticker. */
+  private update(_deltaMS: number) {
+    if (!this._rive) { this.debug('update.skip.no_rive'); return; }
+    if (!this._ticker) { this.debug('update.skip.no_ticker'); return; }
+    this.blitAndUpload('update.upload');
   }
 
   // ----------------- Logging helpers -----------------
-
-  private log(msg: string, extra?: unknown) {
-    if (!this._debug) return;
-    // eslint-disable-next-line no-console
-    console.info(`${this.TAG} ${msg}`, extra ?? '');
-  }
-
-  private debug(msg: string, extra?: unknown) {
-    if (!this._debug) return;
-    // eslint-disable-next-line no-console
-    console.debug(`${this.TAG} ${msg}`, extra ?? '');
-  }
-
-  private warn(msg: string, extra?: unknown) {
-    if (!this._debug) return;
-    // eslint-disable-next-line no-console
-    console.warn(`${this.TAG} ${msg}`, extra ?? '');
-  }
-
-  private error(msg: string, extra?: unknown) {
-    // eslint-disable-next-line no-console
-    console.error(`${this.TAG} ${msg}`, extra ?? '');
-  }
+  private log(msg: string, extra?: unknown) { if (!this._debug) return; console.info(`${this.TAG} ${msg}`, extra ?? ''); }
+  private debug(msg: string, extra?: unknown) { if (!this._debug) return; console.debug(`${this.TAG} ${msg}`, extra ?? ''); }
+  private warn(msg: string, extra?: unknown) { if (!this._debug) return; console.warn(`${this.TAG} ${msg}`, extra ?? ''); }
+  private error(msg: string, extra?: unknown) { console.error(`${this.TAG} ${msg}`, extra ?? ''); }
 }
 
 export default RiveSprite;
